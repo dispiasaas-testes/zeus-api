@@ -1,0 +1,34 @@
+services:
+  whatsapp_postgres:
+    image: postgres:16
+    container_name: whatsapp_postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: awtbtc01
+      POSTGRES_PASSWORD: q5serufjrgk2vwqpvyc4
+      POSTGRES_DB: whatsapp_api
+    volumes:
+      - aw_pgdata:/var/lib/postgresql/data
+
+  whatsapp_redis:
+    image: redis:7-alpine
+    container_name: whatsapp_redis
+    restart: unless-stopped
+    command: ["redis-server", "--appendonly", "yes"] # Habilita persistência de dados
+
+  whatsapp_api_node:
+    build: .
+    container_name: whatsapp_api_node
+    restart: unless-stopped
+    depends_on:
+      - whatsapp_postgres
+      - whatsapp_redis
+    environment:
+      - DB_HOST=whatsapp_postgres
+      - REDIS_HOST=whatsapp_redis
+      - PORT=3000
+    ports:
+      - "3000:3000"
+
+volumes:
+  aw_pgdata:
