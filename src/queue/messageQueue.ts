@@ -10,7 +10,6 @@ interface MessagePayload {
     mediaUrl?: string;
     mediaType?: 'image' | 'video' | 'audio' | 'document';
     mimetype?: string;
-    // 🔥 NOVA PROPRIEDADE: Tipagem para evitar o erro TS2353
     metadata?: {
         ip: string;
         region: string;
@@ -62,7 +61,6 @@ const messageWorker = new Worker<MessagePayload>(
     'whatsapp-messages',
     async (job: Job<MessagePayload>) => {
         const { tenantId, number, text, mediaUrl, mediaType, mimetype, metadata } = job.data;
-
         const session = getSession(tenantId);
 
         if (!session || session.status !== 'CONNECTED') {
@@ -79,22 +77,27 @@ const messageWorker = new Worker<MessagePayload>(
         let sentMsg;
         let contentStr = text || `[Mídia: ${mediaType}]`;
 
-        if (mediaUrl && mediaType) {
-            let messageContent: any = {};
-            
-            if (mediaType === 'image') messageContent = { image: { url: mediaUrl }, caption: text };
-            else if (mediaType === 'video') messageContent = { video: { url: mediaUrl }, caption: text };
-            else if (mediaType === 'audio') messageContent = { audio: { url: mediaUrl }, ptt: true }; 
-            else if (mediaType === 'document') messageContent = { document: { url: mediaUrl }, mimetype: mimetype || 'application/pdf', fileName: text || 'documento' };
+        try {
+            if (mediaUrl && mediaType) {
+                let messageContent: any = {};
+                
+                if (mediaType === 'image') messageContent = { image: { url: mediaUrl }, caption: text };
+                else if (mediaType === 'video') messageContent = { video: { url: mediaUrl }, caption: text };
+                else if (mediaType === 'audio') messageContent = { audio: { url: mediaUrl }, ptt: true }; 
+                else if (mediaType === 'document') messageContent = { document: { url: mediaUrl }, mimetype: mimetype || 'application/pdf', fileName: text || 'documento' };
 
-            sentMsg = await session.sock.sendMessage(validJid, messageContent);
-            console.log(`[Worker] ✅ Mídia (${mediaType}) enviada para ${validJid} (Tenant: ${tenantId})`);
-        } else if (text) {
-            sentMsg = await session.sock.sendMessage(validJid, { text });
-            console.log(`[Worker] ✅ Texto enviado para ${validJid} (Tenant: ${tenantId})`);
+                sentMsg = await session.sock.sendMessage(validJid, messageContent);
+                console.log(`[Worker] ✅ Mídia (${mediaType}) enviada para ${validJid} (Tenant: ${tenantId})`);
+            } else if (text) {
+                sentMsg = await session.sock.sendMessage(validJid, { text });
+                console.log(`[Worker] ✅ Texto enviado para ${validJid} (Tenant: ${tenantId})`);
+            }
+        } catch (err: any) {
+            console.error(`[Worker] ❌ Erro ao enviar mensagem para ${validJid} (Tenant: ${tenantId}):`, err.message);
+            throw err;
         }
 
-        // 🔥 SALVA O LOG DE MENSAGEM ENVIADA VIA API NO BANCO
+        // 🔥 LOG COMPLETO COM ID SESSÃO, DATA/HORA, IP E JID (SALVA NO BANCO)
         if (sentMsg?.key?.id && metadata) {
             try {
                 await pool.query(
@@ -103,7 +106,7 @@ const messageWorker = new Worker<MessagePayload>(
                     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)`,
                     [
                         tenantId, 
-                        validJid, 
+                        validJid, // Salva o JID atual (futuro-prova)
                         sentMsg.key.id, 
                         'SENT_API', 
                         'SENT', 

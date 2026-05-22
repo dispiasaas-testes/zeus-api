@@ -39,7 +39,8 @@ export const initTenantSession = async (tenantId: string) => {
         auth: state,
         printQRInTerminal: false,
         logger,
-        browser: Browsers.ubuntu('Chrome'), 
+        // 🔥 ALTERAÇÃO AQUI:
+        browser: ['Zeus-API', 'Chrome', '1.0.0'], 
     });
 
     sock.ev.on('connection.update', async (update) => {
