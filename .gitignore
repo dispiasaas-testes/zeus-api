@@ -1,0 +1,21 @@
+# Pastas de dependências
+node_modules/
+dist/
+frontend/
+
+# Logs e arquivos temporários
+*.log
+npm-debug.log*
+.DS_Store
+
+# Variáveis de ambiente (Segurança)
+.env
+
+# Docker
+pgdata/
+redis-data/
+
+# Pastas de IDE e Sistemas
+.vscode/
+.idea/
+Thumbs.db

@@ -1,0 +1,1062 @@
+
+
+=== src/queue/redis.ts ===
+import { Redis } from 'ioredis';
+
+// Se estiver no Docker, usará a variável de ambiente. Senão, usa o localhost.
+const REDIS_HOST = process.env.REDIS_HOST || '127.0.0.1';
+
+export const redisConnection = new Redis({
+    host: REDIS_HOST,
+    port: 6379,
+    maxRetriesPerRequest: null,
+});
+
+redisConnection.on('connect', () => {
+    console.log(`🔴 Conectado ao Redis em ${REDIS_HOST}`);
+});
+
+redisConnection.on('error', (err) => {
+    console.error('❌ Erro no Redis:', err);
+});
+
+=== src/queue/messageQueue.ts ===
+import { Queue, Worker, Job } from 'bullmq';
+import { redisConnection } from './redis';
+import { getSession } from '../whatsapp/manager';
+import { pool } from '../database';
+
+interface MessagePayload {
+    tenantId: string;
+    number: string;
+    text?: string;
+    mediaUrl?: string;
+    mediaType?: 'image' | 'video' | 'audio' | 'document';
+    mimetype?: string;
+    // 🔥 NOVA PROPRIEDADE: Tipagem para evitar o erro TS2353
+    metadata?: {
+        ip: string;
+        region: string;
+        date: string;
+        time: string;
+    };
+}
+
+export const messageQueue = new Queue<MessagePayload>('whatsapp-messages', {
+    connection: redisConnection,
+    defaultJobOptions: {
+        attempts: 3,
+        backoff: {
+            type: 'exponential',
+            delay: 2000,
+        },
+        removeOnComplete: true,
+    },
+});
+
+const getValidJid = async (sock: any, rawNumber: string): Promise<string | null> => {
+    let [result] = await sock.onWhatsApp(rawNumber);
+    if (result?.exists) return result.jid;
+
+    if (rawNumber.startsWith('55') && (rawNumber.length === 12 || rawNumber.length === 13)) {
+        const ddd = rawNumber.substring(2, 4);
+        const numeroLocal = rawNumber.substring(4);
+        
+        let variacao = '';
+        
+        if (numeroLocal.length === 9) {
+            variacao = `55${ddd}${numeroLocal.substring(1)}`;
+        } else if (numeroLocal.length === 8) {
+            variacao = `55${ddd}9${numeroLocal}`;
+        }
+
+        if (variacao) {
+            let [resultVariacao] = await sock.onWhatsApp(variacao);
+            if (resultVariacao?.exists) {
+                console.log(`[Worker] Auto-Correção de Nono Dígito: ${rawNumber} -> ${variacao}`);
+                return resultVariacao.jid;
+            }
+        }
+    }
+    return null;
+};
+
+const messageWorker = new Worker<MessagePayload>(
+    'whatsapp-messages',
+    async (job: Job<MessagePayload>) => {
+        const { tenantId, number, text, mediaUrl, mediaType, mimetype, metadata } = job.data;
+
+        const session = getSession(tenantId);
+
+        if (!session || session.status !== 'CONNECTED') {
+            throw new Error(`Sessão do tenant ${tenantId} não está conectada.`);
+        }
+
+        const validJid = await getValidJid(session.sock, number);
+        
+        if (!validJid) {
+            console.error(`[Worker] ❌ Abortado: O número ${number} não possui WhatsApp ativo (Tenant: ${tenantId})`);
+            return; 
+        }
+        
+        let sentMsg;
+        let contentStr = text || `[Mídia: ${mediaType}]`;
+
+        if (mediaUrl && mediaType) {
+            let messageContent: any = {};
+            
+            if (mediaType === 'image') messageContent = { image: { url: mediaUrl }, caption: text };
+            else if (mediaType === 'video') messageContent = { video: { url: mediaUrl }, caption: text };
+            else if (mediaType === 'audio') messageContent = { audio: { url: mediaUrl }, ptt: true }; 
+            else if (mediaType === 'document') messageContent = { document: { url: mediaUrl }, mimetype: mimetype || 'application/pdf', fileName: text || 'documento' };
+
+            sentMsg = await session.sock.sendMessage(validJid, messageContent);
+            console.log(`[Worker] ✅ Mídia (${mediaType}) enviada para ${validJid} (Tenant: ${tenantId})`);
+        } else if (text) {
+            sentMsg = await session.sock.sendMessage(validJid, { text });
+            console.log(`[Worker] ✅ Texto enviado para ${validJid} (Tenant: ${tenantId})`);
+        }
+
+        // 🔥 SALVA O LOG DE MENSAGEM ENVIADA VIA API NO BANCO
+        if (sentMsg?.key?.id && metadata) {
+            try {
+                await pool.query(
+                    `INSERT INTO messages_log 
+                    (tenant_id, remote_jid, message_id, direction, status, content, original_content, api_ip, api_region, event_date, event_time) 
+                    VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)`,
+                    [
+                        tenantId, 
+                        validJid, 
+                        sentMsg.key.id, 
+                        'SENT_API', 
+                        'SENT', 
+                        contentStr, 
+                        contentStr, 
+                        metadata.ip, 
+                        metadata.region, 
+                        metadata.date, 
+                        metadata.time
+                    ]
+                );
+            } catch (dbErr: any) {
+                console.error('[Worker] Falha ao registrar log de disparo:', dbErr.message);
+            }
+        }
+    },
+    { 
+        connection: redisConnection,
+        concurrency: 5 
+    }
+);
+
+messageWorker.on('failed', (job, err) => {
+    console.error(`[Worker] ❌ Falha ao enviar job ${job?.id}:`, err.message);
+});
+
+=== src/middleware/auth.ts ===
+import { Request, Response, NextFunction } from 'express';
+import { pool } from '../database';
+import 'dotenv/config';
+
+export const apiKeyAuth = async (req: Request, res: Response, next: NextFunction) => {
+    const authHeader = req.headers.authorization;
+    if (!authHeader) return res.status(401).json({ error: 'Token não fornecido' });
+
+    const token = authHeader.split(' ')[1];
+    
+    // LOG DE SEGURANÇA NO TERMINAL
+    console.log(`[AUTH] Tentando acesso em: ${req.originalUrl}`);
+    console.log(`[AUTH] Token recebido: ${token}`);
+
+    try {
+        if (token === process.env.API_KEY) {
+            console.log("[AUTH] Master Key validada com sucesso.");
+            return next();
+        }
+
+        const { rows } = await pool.query('SELECT tenant_id FROM api_keys WHERE api_key = $1', [token]);
+        
+        if (rows.length === 0) {
+            console.log("[AUTH] Chave não encontrada no banco.");
+            return res.status(403).json({ error: 'API Key inválida' });
+        }
+
+        const dbTenant = rows[0].tenant_id;
+        const urlTenant = req.params.tenantId;
+
+        console.log(`[AUTH] Comparando DB Tenant [${dbTenant}] vs URL Tenant [${urlTenant}]`);
+
+        if (urlTenant && urlTenant !== dbTenant) {
+            return res.status(403).json({ error: `Permissão negada. Você é dono de ${dbTenant}, não de ${urlTenant}` });
+        }
+
+        next();
+    } catch (e) {
+        res.status(500).json({ error: 'Erro no auth' });
+    }
+};
+
+=== src/whatsapp/manager.ts ===
+import { makeWASocket, DisconnectReason, fetchLatestBaileysVersion, Browsers } from '@whiskeysockets/baileys';
+import { Boom } from '@hapi/boom';
+import pino from 'pino';
+import axios from 'axios';
+import { pool } from '../database';
+import { usePostgresAuthState } from './postgresAuth';
+
+const sessions = new Map<string, any>();
+const logger = pino({ level: 'silent' });
+
+const WEBHOOK_URL = process.env.WEBHOOK_URL || 'http://localhost:3333/api/webhook'; 
+
+// Função auxiliar para data e hora no padrão brasileiro
+const getBrDateTime = () => {
+    const now = new Date();
+    return {
+        date: now.toLocaleDateString('pt-BR'),
+        time: now.toLocaleTimeString('pt-BR')
+    };
+};
+
+export const initTenantSession = async (tenantId: string) => {
+    const { state, saveCreds, removeCreds } = await usePostgresAuthState(tenantId, pool);
+    
+    const { version } = await fetchLatestBaileysVersion();
+    console.log(`[${tenantId}] Inicializando com WA v${version.join('.')} via PostgreSQL`);
+
+    const sock = makeWASocket({
+        version,
+        auth: state,
+        printQRInTerminal: false,
+        logger,
+        browser: Browsers.ubuntu('Chrome'), 
+    });
+
+    sock.ev.on('connection.update', async (update) => {
+        const { connection, lastDisconnect, qr } = update;
+        
+        if (qr) {
+            console.log(`[${tenantId}] Novo QR Code gerado`);
+            sessions.set(tenantId, { ...sessions.get(tenantId), qrCode: qr, status: 'WAITING_QR' });
+        }
+
+        if (connection === 'close') {
+            const statusCode = (lastDisconnect?.error as Boom)?.output?.statusCode;
+            const shouldReconnect = statusCode !== DisconnectReason.loggedOut;
+            
+            console.log(`[${tenantId}] Conexão fechada (Código: ${statusCode}). Reconectando: ${shouldReconnect}`);
+            
+            if (shouldReconnect) {
+                setTimeout(() => initTenantSession(tenantId), 3000);
+            } else {
+                await removeCreds();
+                sessions.delete(tenantId);
+                console.log(`[${tenantId}] Sessão encerrada e dados apagados do PostgreSQL.`);
+            }
+        } else if (connection === 'open') {
+            console.log(`[${tenantId}] Conectado com sucesso!`);
+            sessions.set(tenantId, { sock, status: 'CONNECTED', qrCode: null });
+        }
+    });
+
+    sock.ev.on('creds.update', saveCreds);
+    
+    // 🔥 EVENTOS: CAPTURA DE LEITURA E ENTREGA (STATUS)
+    sock.ev.on('messages.update', async (updates) => {
+        for (const update of updates) {
+            const msgId = update.key.id;
+            let statusStr = '';
+
+            // Mapeia os status do Baileys para texto
+            if (update.update.status === 2) statusStr = 'RECEIVED_BY_SERVER'; // Sent
+            if (update.update.status === 3) statusStr = 'DELIVERED'; // Entregue
+            if (update.update.status === 4) statusStr = 'READ'; // Lido/Reproduzido
+
+            if (statusStr && msgId) {
+                try {
+                    await pool.query(
+                        `UPDATE messages_log SET status = $1 WHERE tenant_id = $2 AND message_id = $3`,
+                        [statusStr, tenantId, msgId]
+                    );
+                } catch (error) {}
+            }
+        }
+    });
+
+    // 🔥 EVENTOS: RECEBIMENTO, EDIÇÃO E EXCLUSÃO
+    sock.ev.on('messages.upsert', async (m) => {
+        if (m.type === 'notify') {
+            for (const msg of m.messages) {
+                const remoteJid = msg.key.remoteJid;
+                const messageId = msg.key.id;
+                const messageObj = msg.message;
+                const { date, time } = getBrDateTime();
+                
+                if (!messageObj || !remoteJid || !messageId) continue;
+
+                // 1. DETECÇÃO DE MENSAGEM APAGADA PARA TODOS (REVOKE)
+                if (messageObj.protocolMessage?.type === 0 || messageObj.protocolMessage?.type === 14) {
+                    const deletedMsgId = messageObj.protocolMessage.key?.id;
+                    if (deletedMsgId) {
+                        console.log(`[${tenantId}] 🗑️ Mensagem Apagada: ${deletedMsgId}`);
+                        await pool.query(
+                            `UPDATE messages_log SET is_deleted = TRUE WHERE tenant_id = $1 AND message_id = $2`,
+                            [tenantId, deletedMsgId]
+                        );
+                    }
+                    continue;
+                }
+
+                // 2. DETECÇÃO DE MENSAGEM EDITADA
+                if (messageObj.editedMessage) {
+                    const editedMsgId = messageObj.protocolMessage?.key?.id;
+                    const newContent = messageObj.editedMessage.message?.protocolMessage?.editedMessage?.conversation || 
+                                       messageObj.editedMessage.message?.extendedTextMessage?.text || '[Edição Complexa]';
+                    
+                    if (editedMsgId) {
+                        console.log(`[${tenantId}] ✏️ Mensagem Editada: ${editedMsgId} -> ${newContent}`);
+                        await pool.query(
+                            `UPDATE messages_log SET is_edited = TRUE, content = $1 WHERE tenant_id = $2 AND message_id = $3`,
+                            [newContent, tenantId, editedMsgId]
+                        );
+                    }
+                    continue;
+                }
+
+                // Ignora mensagens enviadas por nós mesmos se não for edição/deleção
+                if (msg.key.fromMe || remoteJid === 'status@broadcast') continue;
+
+                const messageType = Object.keys(messageObj)[0];
+                let content = '';
+
+                if (messageType === 'conversation') content = messageObj.conversation || '';
+                else if (messageType === 'extendedTextMessage') content = messageObj.extendedTextMessage?.text || '';
+                else if (messageType === 'imageMessage') content = '[Imagem]';
+                else if (messageType === 'videoMessage') content = '[Vídeo]';
+                else if (messageType === 'audioMessage') content = '[Áudio]';
+                else if (messageType === 'documentMessage') content = '[Documento]';
+                else if (messageType === 'stickerMessage') content = '[Figurinha]';
+                else content = `[Outro Formato: ${messageType}]`;
+
+                console.log(`[${tenantId}] 📩 Nova mensagem de ${remoteJid}: ${content}`);
+
+                // Grava a mensagem recebida no banco perpétuo
+                try {
+                    await pool.query(
+                        `INSERT INTO messages_log 
+                        (tenant_id, remote_jid, message_id, direction, status, content, original_content, api_ip, api_region, event_date, event_time) 
+                        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
+                        ON CONFLICT DO NOTHING`,
+                        [tenantId, remoteJid, messageId, 'RECEIVED_WA', 'DELIVERED', content, content, 'Rede WhatsApp (E2E)', 'N/A', date, time]
+                    );
+                } catch (dbErr) {}
+
+                try {
+                    await axios.post(WEBHOOK_URL, {
+                        tenantId,
+                        from: remoteJid,
+                        pushName: msg.pushName || 'Desconhecido',
+                        messageType,
+                        content,
+                        timestamp: msg.messageTimestamp,
+                        isGroup: remoteJid?.endsWith('@g.us')
+                    });
+                } catch (error: any) {}
+            }
+        }
+    });
+
+    if (!sessions.has(tenantId)) {
+        sessions.set(tenantId, { sock, status: 'INITIALIZING', qrCode: null });
+    }
+
+    return sock;
+};
+
+export const getSession = (tenantId: string) => sessions.get(tenantId);
+
+export const getAllSessions = () => {
+    return Array.from(sessions.entries()).map(([id, data]) => ({
+        tenantId: id,
+        status: data.status
+    }));
+};
+
+export const loadAllSessionsFromDatabase = async () => {
+    try {
+        await pool.query(`
+            CREATE TABLE IF NOT EXISTS whatsapp_sessions_v2 (
+                tenant_id VARCHAR(255) NOT NULL,
+                key_id TEXT NOT NULL,
+                data TEXT NOT NULL,
+                PRIMARY KEY (tenant_id, key_id)
+            );
+        `);
+
+        const { rows } = await pool.query("SELECT DISTINCT tenant_id FROM whatsapp_sessions_v2 WHERE key_id = 'creds'");
+
+        console.log(`[Autoboot] Encontradas ${rows.length} sessões prontas para restauração no PostgreSQL.`);
+
+        for (const row of rows) {
+            console.log(`[Autoboot] Restaurando conexão automática para o Tenant: ${row.tenant_id}`);
+            initTenantSession(row.tenant_id).catch(err => {
+                console.error(`[Autoboot] Erro ao restaurar o tenant ${row.tenant_id}:`, err.message);
+            });
+        }
+    } catch (error: any) {
+        console.error('[Autoboot] Erro ao ler sessões do banco de dados:', error.message);
+    }
+};
+
+export const generatePairingCode = async (tenantId: string, phoneNumber: string) => {
+    const session = sessions.get(tenantId);
+    
+    if (!session || !session.sock) throw new Error('Sessão não encontrada ou ainda não inicializada.');
+
+    const cleanNumber = phoneNumber.replace(/\D/g, '');
+    if (!cleanNumber.startsWith('55') || cleanNumber.length < 12) {
+        throw new Error('Número inválido. Certifique-se de incluir o DDI (55) e o DDD.');
+    }
+
+    await new Promise(resolve => setTimeout(resolve, 1500));
+    const code = await session.sock.requestPairingCode(cleanNumber);
+    return code;
+};
+
+=== src/whatsapp/postgresAuth.ts ===
+import { initAuthCreds, BufferJSON, proto, SignalDataTypeMap, AuthenticationState } from '@whiskeysockets/baileys';
+import { Pool } from 'pg';
+
+export const usePostgresAuthState = async (tenantId: string, pool: Pool) => {
+    await pool.query(`
+        CREATE TABLE IF NOT EXISTS whatsapp_sessions_v2 (
+            tenant_id VARCHAR(255) NOT NULL,
+            key_id TEXT NOT NULL,
+            data TEXT NOT NULL,
+            PRIMARY KEY (tenant_id, key_id)
+        );
+    `);
+
+    const writeData = async (data: any, keyId: string) => {
+        const dataString = JSON.stringify(data, BufferJSON.replacer);
+        await pool.query(
+            `INSERT INTO whatsapp_sessions_v2 (tenant_id, key_id, data) VALUES ($1, $2, $3)
+             ON CONFLICT (tenant_id, key_id) DO UPDATE SET data = EXCLUDED.data`,
+            [tenantId, keyId, dataString]
+        );
+    };
+
+    const readData = async (keyId: string) => {
+        const { rows } = await pool.query(
+            `SELECT data FROM whatsapp_sessions_v2 WHERE tenant_id = $1 AND key_id = $2`,
+            [tenantId, keyId]
+        );
+        if (rows.length > 0) {
+            return JSON.parse(rows[0].data, BufferJSON.reviver);
+        }
+        return null;
+    };
+
+    const removeData = async (keyId: string) => {
+        await pool.query(`DELETE FROM whatsapp_sessions_v2 WHERE tenant_id = $1 AND key_id = $2`, [tenantId, keyId]);
+    };
+
+    let creds = await readData('creds');
+    if (!creds) {
+        creds = initAuthCreds();
+        await writeData(creds, 'creds');
+    }
+
+    return {
+        // O casting 'as AuthenticationState' resolve o erro do compilador tsc
+        state: {
+            creds,
+            keys: {
+                get: async (type: keyof SignalDataTypeMap, ids: string[]) => {
+                    const data: { [key: string]: any } = {}; // Tipado como 'any' para evitar conflito de union types no build
+                    await Promise.all(
+                        ids.map(async (id) => {
+                            let value = await readData(`${type}-${id}`);
+                            if (type === 'app-state-sync-key' && value) {
+                                value = proto.Message.AppStateSyncKeyData.fromObject(value);
+                            }
+                            data[id] = value;
+                        })
+                    );
+                    return data;
+                },
+                set: async (data: any) => {
+                    const tasks: Promise<any>[] = [];
+                    for (const category in data) {
+                        for (const id in data[category]) {
+                            const value = data[category][id];
+                            const key = `${category}-${id}`;
+                            if (value) {
+                                tasks.push(writeData(value, key));
+                            } else {
+                                tasks.push(removeData(key));
+                            }
+                        }
+                    }
+                    await Promise.all(tasks);
+                }
+            }
+        } as AuthenticationState,
+        saveCreds: () => writeData(creds, 'creds'),
+        removeCreds: async () => {
+            await pool.query(`DELETE FROM whatsapp_sessions_v2 WHERE tenant_id = $1`, [tenantId]);
+        }
+    };
+};
+
+=== src/database.ts ===
+import { Pool } from 'pg';
+import 'dotenv/config';
+
+export const pool = new Pool({
+    connectionString: process.env.DATABASE_URL
+});
+
+pool.on('connect', () => {});
+
+pool.on('error', (err) => {
+    console.error('❌ Erro inesperado no pool do PostgreSQL', err);
+    process.exit(-1);
+});
+
+export const initializeDatabase = async () => {
+    try {
+        // Tabela de API Keys
+        await pool.query(`
+            CREATE TABLE IF NOT EXISTS api_keys (
+                tenant_id VARCHAR(255) PRIMARY KEY,
+                api_key VARCHAR(255) UNIQUE NOT NULL,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            );
+        `);
+
+        // 🔥 NOVA TABELA: Log Perpétuo de Mensagens
+        await pool.query(`
+            CREATE TABLE IF NOT EXISTS messages_log (
+                id SERIAL PRIMARY KEY,
+                tenant_id VARCHAR(255) NOT NULL,
+                remote_jid VARCHAR(255) NOT NULL,
+                message_id VARCHAR(255) NOT NULL,
+                direction VARCHAR(50) NOT NULL, -- 'SENT_API' ou 'RECEIVED_WA'
+                status VARCHAR(50) DEFAULT 'PENDING', -- PENDING, SENT, DELIVERED, READ, PLAYED
+                content TEXT,
+                media_url TEXT,
+                is_deleted BOOLEAN DEFAULT FALSE,
+                is_edited BOOLEAN DEFAULT FALSE,
+                original_content TEXT,
+                api_ip VARCHAR(100),
+                api_region VARCHAR(255),
+                event_date VARCHAR(20), -- DD/MM/AAAA
+                event_time VARCHAR(20), -- HH:MM:SS
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                UNIQUE(tenant_id, message_id)
+            );
+        `);
+        console.log('📦 Banco de dados e tabelas de log inicializados com sucesso.');
+    } catch (error: any) {
+        console.error('❌ Erro ao inicializar o banco de dados:', error.message);
+    }
+};
+
+=== src/index.ts ===
+// @ts-nocheck
+import 'dotenv/config';
+import express, { Request, Response, NextFunction } from 'express';
+import { initTenantSession, getSession, getAllSessions, loadAllSessionsFromDatabase, generatePairingCode } from './whatsapp/manager';
+import qrcode from 'qrcode';
+import { messageQueue } from './queue/messageQueue';
+import { apiKeyAuth } from './middleware/auth';
+import { pool, initializeDatabase } from './database';
+import crypto from 'crypto';
+import axios from 'axios';
+import swaggerUi from 'swagger-ui-express';
+import swaggerJsDoc from 'swagger-jsdoc';
+import cors from 'cors';
+
+const app = express();
+app.use(cors({ origin: '*' }));
+app.use(express.json());
+
+// ==========================================
+// CONFIGURAÇÃO DO SWAGGER (À Prova de Falhas)
+// ==========================================
+const swaggerOptions = {
+    swaggerDefinition: {
+        openapi: '3.0.0',
+        info: {
+            title: 'SaaS WhatsApp API Gateway',
+            version: '1.0.0',
+            description: 'Painel unificado para manutenção, testes rápidos e gerenciamento de instâncias multitenant.',
+        },
+        servers: [{ url: 'http://localhost:3000', description: 'Servidor Local / Desenvolvimento' }],
+        components: {
+            securitySchemes: {
+                bearerAuth: {
+                    type: 'http',
+                    scheme: 'bearer',
+                    bearerFormat: 'API Key ou Master Key',
+                }
+            }
+        },
+        security: [{ bearerAuth: [] }],
+        // 🔥 DECLARAÇÃO DIRETA E INFALÍVEL DAS ROTAS (Substitui os comentários problemáticos)
+        paths: {
+            '/api/v1/admin/tenants': {
+                post: {
+                    summary: 'Criar uma nova instância de Tenant',
+                    requestBody: {
+                        required: true,
+                        content: {
+                            'application/json': {
+                                schema: {
+                                    type: 'object',
+                                    required: ['tenantId'],
+                                    properties: { tenantId: { type: 'string', example: 'cliente_teste_123' } }
+                                }
+                            }
+                        }
+                    },
+                    responses: { 200: { description: 'Instância criada com sucesso e chave gerada.' } }
+                }
+            },
+            '/api/v1/sessions/{tenantId}/pairing-code': {
+                post: {
+                    summary: 'Solicitar Código PIN',
+                    parameters: [{ in: 'path', name: 'tenantId', required: true, schema: { type: 'string' } }],
+                    requestBody: {
+                        required: true,
+                        content: {
+                            'application/json': {
+                                schema: {
+                                    type: 'object',
+                                    required: ['phoneNumber'],
+                                    properties: { phoneNumber: { type: 'string', example: '5541999999999' } }
+                                }
+                            }
+                        }
+                    },
+                    responses: { 200: { description: 'Código PIN gerado' } }
+                }
+            },
+            '/api/v1/sessions/{tenantId}/messages': {
+                post: {
+                    summary: 'Disparar Mensagem (Texto/Mídia)',
+                    parameters: [{ in: 'path', name: 'tenantId', required: true, schema: { type: 'string' } }],
+                    requestBody: {
+                        required: true,
+                        content: {
+                            'application/json': {
+                                schema: {
+                                    type: 'object',
+                                    required: ['number'],
+                                    properties: {
+                                        number: { type: 'string', example: '5541999999999' },
+                                        text: { type: 'string', example: 'Olá! Mensagem da API.' },
+                                        mediaUrl: { type: 'string', example: 'https://exemplo.com/doc.pdf' },
+                                        mediaType: { type: 'string', example: 'document', description: 'image, video, audio, document' }
+                                    }
+                                }
+                            }
+                        }
+                    },
+                    responses: { 200: { description: 'Mensagem adicionada à fila auditada' } }
+                }
+            },
+            '/api/v1/sessions/{tenantId}': {
+                get: {
+                    summary: 'Interface de Conexão HTML (QR/PIN)',
+                    parameters: [{ in: 'path', name: 'tenantId', required: true, schema: { type: 'string' } }],
+                    responses: { 200: { description: 'Painel HTML Renderizado' } }
+                },
+                delete: {
+                    summary: 'Desconectar Sessão (Logout)',
+                    parameters: [{ in: 'path', name: 'tenantId', required: true, schema: { type: 'string' } }],
+                    responses: { 200: { description: 'Desconectado e banco limpo' } }
+                }
+            },
+            '/api/v1/sessions': {
+                get: {
+                    summary: 'Listar instâncias ativas na memória',
+                    responses: { 200: { description: 'Lista retornada' } }
+                }
+            }
+        }
+    },
+    apis: [], // Deixado vazio de propósito para forçar a leitura do bloco JSON acima
+};
+
+const swaggerDocs = swaggerJsDoc(swaggerOptions);
+
+// 🔒 PROTEÇÃO DO SWAGGER
+app.use('/api-docs', (req: Request, res: Response, next: NextFunction) => {
+    // Libera os arquivos visuais do Swagger para a tela não ficar branca
+    if (req.url.includes('.css') || req.url.includes('.js') || req.url.includes('.png')) {
+        return next();
+    }
+
+    const { key } = req.query;
+    const masterKey = process.env.API_KEY;
+
+    if (!masterKey) return res.status(500).send('Erro: API_KEY Master não configurada no .env');
+
+    if (key === masterKey || req.headers.authorization?.includes(masterKey)) {
+        next();
+    } else {
+        res.status(401).send('Acesso Negado: Forneça a Master Key correta na URL. Exemplo: /api-docs/?key=sua_master_key');
+    }
+}, swaggerUi.serve, swaggerUi.setup(swaggerDocs));
+
+// 🔒 Aplica o middleware global de segurança para todas as rotas da API v1
+app.use('/api/v1', apiKeyAuth);
+
+// Função auxiliar para resolver Data e Hora no padrão brasileiro
+const getBrDateTime = () => {
+    const now = new Date();
+    return {
+        date: now.toLocaleDateString('pt-BR'),
+        time: now.toLocaleTimeString('pt-BR')
+    };
+};
+
+const getIpLocation = async (ip: string): Promise<{ ip: string; region: string }> => {
+    if (!ip || ip === '127.0.0.1' || ip === '::1' || ip.startsWith('::ffff:127.0.0.1')) {
+        return { ip: '127.0.0.1 (Localhost)', region: 'Ambiente Local / Dev' };
+    }
+
+    const cleanIp = ip.replace('::ffff:', '');
+
+    try {
+        const response = await axios.get(`http://ip-api.com/json/${cleanIp}?fields=status,country,regionName,city`);
+        if (response.data && response.data.status === 'success') {
+            return {
+                ip: cleanIp,
+                region: `${response.data.city}, ${response.data.regionName} - ${response.data.country}`
+            };
+        }
+        return { ip: cleanIp, region: 'Região Não Identificada' };
+    } catch (error) {
+        return { ip: cleanIp, region: 'Falha no Provedor de Geolocalização' };
+    }
+};
+
+// ==========================================
+// ROTAS DA API
+// ==========================================
+
+app.post('/api/v1/admin/tenants', async (req: Request, res: Response) => {
+    const { tenantId } = req.body;
+
+    if (!tenantId) {
+        return res.status(400).json({ error: 'O campo tenantId é obrigatório.' });
+    }
+
+    const newApiKey = 'sk_live_wa_' + crypto.randomBytes(16).toString('hex');
+
+    try {
+        await pool.query(
+            `INSERT INTO api_keys (tenant_id, api_key) VALUES ($1, $2) 
+             ON CONFLICT (tenant_id) DO UPDATE SET api_key = EXCLUDED.api_key`,
+            [tenantId, newApiKey]
+        );
+
+        res.json({
+            success: true,
+            message: `Instância para o tenant '${tenantId}' criada com sucesso!`,
+            tenantId: tenantId,
+            apiKey: newApiKey
+        });
+    } catch (error: any) {
+        res.status(500).json({ error: 'Erro ao gerar API Key', details: error.message });
+    }
+});
+
+app.post('/api/v1/sessions/:tenantId/pairing-code', async (req: Request, res: Response) => {
+    const { tenantId } = req.params;
+    const { phoneNumber } = req.body;
+
+    if (!phoneNumber) {
+        return res.status(400).json({ error: 'O número de telefone é obrigatório.' });
+    }
+
+    try {
+        // 🔥 ADIÇÃO: Verifica se a sessão existe, se não, inicia ela agora
+        let session = getSession(tenantId);
+        if (!session) {
+            await initTenantSession(tenantId);
+            // Aguarda um momento para o processo de inicialização começar
+            await new Promise(resolve => setTimeout(resolve, 2000));
+        }
+
+        const code = await generatePairingCode(tenantId, phoneNumber);
+        res.json({ success: true, code });
+    } catch (error: any) {
+        res.status(500).json({ error: error.message || 'Erro ao gerar o PIN.' });
+    }
+});
+
+app.get('/api/v1/sessions/:tenantId', async (req: Request, res: Response) => {
+    const { tenantId } = req.params;
+    const authToken = req.headers.authorization || '';
+    
+    let session = getSession(tenantId);
+
+    if (!session) {
+        await initTenantSession(tenantId);
+        await new Promise(resolve => setTimeout(resolve, 1500));
+        session = getSession(tenantId);
+    }
+
+    if (session?.status === 'WAITING_QR' && session.qrCode) {
+        const qrBase64 = await qrcode.toDataURL(session.qrCode);
+        
+        const html = `
+            <!DOCTYPE html>
+            <html lang="pt-BR">
+            <head>
+                <meta charset="UTF-8">
+                <meta name="viewport" content="width=device-width, initial-scale=1.0">
+                <title>Conectar - ${tenantId}</title>
+                <style>
+                    body { display: flex; flex-direction: column; justify-content: center; align-items: center; height: 100vh; margin: 0; background-color: #0f172a; color: #f8fafc; font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; }
+                    .card { background: #1e293b; padding: 30px; border-radius: 16px; box-shadow: 0 10px 25px rgba(0,0,0,0.5); text-align: center; border: 1px solid #334155; width: 340px; }
+                    h2 { margin-top: 0; color: #38bdf8; font-size: 1.5rem;}
+                    .tabs { display: flex; margin-bottom: 20px; background: #0f172a; border-radius: 8px; padding: 4px; }
+                    .tab { flex: 1; padding: 10px; cursor: pointer; border-radius: 6px; font-weight: 600; font-size: 0.9rem; transition: all 0.3s; }
+                    .tab.active { background: #38bdf8; color: #0f172a; }
+                    .section { display: none; }
+                    .section.active { display: block; animation: fadeIn 0.4s ease; }
+                    @keyframes fadeIn { from { opacity: 0; transform: translateY(5px); } to { opacity: 1; transform: translateY(0); } }
+                    img.qr { border-radius: 12px; margin: 10px 0; border: 4px solid #fff; width: 240px; height: 240px; }
+                    input { width: 90%; padding: 12px; margin: 15px 0; border-radius: 8px; border: 1px solid #475569; background: #0f172a; color: #fff; text-align: center; font-size: 1rem; outline: none; }
+                    input:focus { border-color: #38bdf8; }
+                    button.btn { width: 100%; background: #38bdf8; color: #0f172a; border: none; padding: 12px; border-radius: 8px; font-weight: bold; font-size: 1rem; cursor: pointer; transition: 0.2s; }
+                    button.btn:hover { background: #0ea5e9; }
+                    button.btn:disabled { background: #475569; cursor: not-allowed; }
+                    .pin-display { margin-top: 20px; font-size: 1.2rem; color: #94a3b8; display: none; }
+                    .pin-display span { display: block; margin-top: 10px; font-size: 2.2rem; font-weight: bold; color: #22c55e; letter-spacing: 6px; }
+                    .status { font-weight: bold; color: #fbbf24; margin-top: 15px; font-size: 0.9rem; }
+                    .footer { margin-top: 10px; font-size: 0.8rem; color: #64748b; }
+                </style>
+            </head>
+            <body>
+                <div class="card">
+                    <h2>Conectar Dispositivo</h2>
+                    
+                    <div class="tabs">
+                        <div class="tab active" onclick="switchTab('qr')">QR Code</div>
+                        <div class="tab" onclick="switchTab('pin')">Telefone (PIN)</div>
+                    </div>
+
+                    <div id="sec-qr" class="section active">
+                        <img class="qr" src="${qrBase64}" alt="QR Code" />
+                        <div class="status">Aguardando leitura...</div>
+                        <div class="footer">A página recarrega em 15s.</div>
+                    </div>
+
+                    <div id="sec-pin" class="section">
+                        <p style="font-size: 0.9rem; color: #cbd5e1; margin-bottom: 5px;">Digite o número que será conectado:</p>
+                        <input type="text" id="phone" placeholder="Ex: 5541999999999" />
+                        <button id="btn-pin" class="btn" onclick="requestPin()">Gerar Código PIN</button>
+                        
+                        <div id="pin-display" class="pin-display">
+                            Seu código de acesso:
+                            <span id="pin-code"></span>
+                            <p style="font-size: 0.8rem; letter-spacing: 0; color: #cbd5e1; margin-top: 15px;">
+                                O WhatsApp mostrará uma notificação no seu celular. Toque nela e digite este código.
+                            </p>
+                        </div>
+                    </div>
+                </div>
+
+                <script>
+                    const authToken = "${authToken}";
+                    let refreshTimer = setTimeout(() => window.location.reload(), 15000);
+
+                    function switchTab(tab) {
+                        document.getElementById('sec-qr').classList.remove('active');
+                        document.getElementById('sec-pin').classList.remove('active');
+                        document.querySelectorAll('.tab')[0].classList.remove('active');
+                        document.querySelectorAll('.tab')[1].classList.remove('active');
+                        
+                        if (tab === 'qr') {
+                            document.getElementById('sec-qr').classList.add('active');
+                            document.querySelectorAll('.tab')[0].classList.add('active');
+                            refreshTimer = setTimeout(() => window.location.reload(), 15000);
+                        } else {
+                            document.getElementById('sec-pin').classList.add('active');
+                            document.querySelectorAll('.tab')[1].classList.add('active');
+                            clearTimeout(refreshTimer);
+                        }
+                    }
+
+                    async function requestPin() {
+                        const btn = document.getElementById('btn-pin');
+                        const phone = document.getElementById('phone').value;
+                        
+                        if(!phone || phone.length < 12) {
+                            alert('Digite um número válido com DDI e DDD. Ex: 5541999999999');
+                            return;
+                        }
+
+                        btn.innerText = 'Gerando Código...';
+                        btn.disabled = true;
+
+                        try {
+                            const response = await fetch('/api/v1/sessions/${tenantId}/pairing-code', {
+                                method: 'POST',
+                                headers: {
+                                    'Content-Type': 'application/json',
+                                    'Authorization': authToken
+                                },
+                                body: JSON.stringify({ phoneNumber: phone })
+                            });
+
+                            const data = await response.json();
+                            
+                            if (data.success && data.code) {
+                                const code = data.code;
+                                const formattedCode = code.match(/.{1,4}/g).join('-');
+                                
+                                document.getElementById('pin-code').innerText = formattedCode;
+                                document.getElementById('pin-display').style.display = 'block';
+                                btn.style.display = 'none'; 
+                                document.getElementById('phone').style.display = 'none'; 
+                            } else {
+                                alert('Erro: ' + (data.error || 'Falha desconhecida.'));
+                                btn.innerText = 'Gerar Código PIN';
+                                btn.disabled = false;
+                            }
+                        } catch (err) {
+                            alert('Erro de comunicação com o servidor.');
+                            btn.innerText = 'Gerar Código PIN';
+                            btn.disabled = false;
+                        }
+                    }
+                </script>
+            </body>
+            </html>
+        `;
+        return res.send(html);
+    }
+
+    if (session?.status === 'CONNECTED') {
+        const htmlConnected = `
+            <!DOCTYPE html>
+            <html lang="pt-BR">
+            <head>
+                <meta charset="UTF-8">
+                <title>Conectado - ${tenantId}</title>
+                <style>
+                    body { display: flex; flex-direction: column; justify-content: center; align-items: center; height: 100vh; margin: 0; background-color: #0f172a; color: #f8fafc; font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; }
+                    .card { background: #1e293b; padding: 40px; border-radius: 16px; box-shadow: 0 10px 25px rgba(0, 255, 128, 0.1); text-align: center; border: 2px solid #22c55e; }
+                    h2 { margin-top: 0; color: #22c55e; }
+                </style>
+            </head>
+            <body>
+                <div class="card">
+                    <h2>✅ Conexão Estabelecida</h2>
+                    <p>O número para <strong>${tenantId}</strong> está autenticado e pronto para disparos.</p>
+                </div>
+            </body>
+            </html>
+        `;
+        return res.send(htmlConnected);
+    }
+
+    res.json({ status: session?.status || 'UNKNOWN' });
+});
+
+app.post('/api/v1/sessions/:tenantId/messages', async (req: Request, res: Response) => {
+    const { tenantId } = req.params;
+    const { number, text, mediaUrl, mediaType, mimetype } = req.body;
+
+    const session = getSession(tenantId);
+    
+    if (!session || session.status !== 'CONNECTED') {
+        return res.status(400).json({ error: 'Sessão não conectada ou inexistente para este tenant.' });
+    }
+
+    const clientRawIp = (req.headers['x-forwarded-for'] as string) || req.socket.remoteAddress || '127.0.0.1';
+    const { ip, region } = await getIpLocation(clientRawIp);
+    const { date, time } = getBrDateTime();
+
+    try {
+        const job = await messageQueue.add('send-message', {
+            tenantId,
+            number,
+            text,
+            mediaUrl,
+            mediaType,
+            mimetype,
+            metadata: {
+                ip,
+                region,
+                date,
+                time
+            }
+        });
+
+        res.json({ 
+            success: true, 
+            message: 'Mensagem adicionada com sucesso à fila de envio auditada.',
+            jobId: job.id 
+        });
+    } catch (error: any) {
+        res.status(500).json({ error: 'Erro ao enfileirar mensagem', details: error.message });
+    }
+});
+
+app.delete('/api/v1/sessions/:tenantId', async (req: Request, res: Response) => {
+    const { tenantId } = req.params;
+    const session = getSession(tenantId);
+
+    if (session?.sock) {
+        await session.sock.logout();
+        res.json({ success: true, message: `Sessão do tenant '${tenantId}' encerrada com sucesso e dados limpos.` });
+    } else {
+        res.status(404).json({ error: 'Sessão não encontrada ou ativa para este cliente.' });
+    }
+});
+
+// ==========================================
+// ROTA ATUALIZADA: Listar instâncias com API Key (Para o seu Painel)
+// ==========================================
+app.get('/api/v1/sessions', async (req: Request, res: Response) => {
+    try {
+        const sessions = getAllSessions();
+        const { rows } = await pool.query('SELECT tenant_id, api_key FROM api_keys');
+        
+        // Mapeia os tenants ativos na memória
+        const result = Object.keys(sessions).map(tenantId => {
+            // Busca o registro no banco pelo nome do tenant
+            const dbMatch = rows.find(r => r.tenant_id.trim() === tenantId.trim());
+            
+            return {
+                id: tenantId, // Esse é o nome real (ex: cliente_teste_123)
+                status: sessions[tenantId].status,
+                apiKey: dbMatch ? dbMatch.api_key : 'Chave não cadastrada'
+            };
+        });
+        
+        res.json(result);
+    } catch (error) {
+        console.error("Erro no GET /sessions:", error);
+        res.status(500).json({ error: 'Erro ao listar instâncias' });
+    }
+});
+
+// ==========================================
+// INICIALIZAÇÃO DO SERVIDOR E AUTOBOOT
+// ==========================================
+const PORT = process.env.PORT || 3000;
+app.listen(PORT, async () => {
+    console.log(`🚀 Gateway rodando na porta ${PORT}`);
+    
+    await initializeDatabase();
+    await loadAllSessionsFromDatabase();
+});
